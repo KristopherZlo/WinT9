@@ -1,15 +1,4 @@
-// __        ___     _____ ___                  
-// \ \      / (_)_ _|_   _/ _ \                 
-//  \ \ /\ / /| | '_ \| || (_) |                
-//   \ V  V / | | | | | | \__, |                
-//  __\_/\_/  |_|_|_|_|_| __/_/     __  ______  
-// | __ ) _   _  |__  / |/ _ \ _   _\ \/ /  _ \ 
-// |  _ \| | | |   / /| | | | | | | |\  /| |_) |
-// | |_) | |_| |  / /_| | |_| | |_| |/  \|  __/ 
-// |____/ \__, | /____|_|\___/ \__, /_/\_\_|    
-//        |___/                |___/            
-//
-// Version 1.0
+// Version 1.5
 #define UNICODE
 #define _UNICODE
 
@@ -23,6 +12,7 @@
 #include <sstream>
 #include <locale>
 #include <codecvt>
+#include <shlobj.h> // Для SHGetFolderPathW
 
 #pragma comment(lib, "dwmapi.lib")
 
@@ -39,8 +29,10 @@ HMENU hMenu = NULL;
 
 HMENU hSubMenu = NULL; // Submenu for Activate/Deactivate
 
-// N-gram model variables
-std::unordered_map<std::wstring, std::unordered_map<std::wstring, int>> ngramModel;
+// N-gram model variables (Unigrams, Bigrams, and Trigrams)
+std::unordered_map<std::wstring, int> unigramModel;
+std::unordered_map<std::wstring, std::unordered_map<std::wstring, int>> bigramModel;
+std::unordered_map<std::wstring, std::unordered_map<std::wstring, int>> trigramModel;
 std::wstring previousWord = L"";
 
 // Variable for completion key
@@ -54,13 +46,19 @@ bool isAutocompleteEnabled = true;
 // Ignored words set
 std::unordered_set<std::wstring> ignoredWords; // Set for ignored words
 
+// Flag to indicate if context menu is open
+bool isContextMenuOpen = false;
+
 // Function declarations
-void LoadNGramModel();
-void SaveNGramModel();
-void LoadUserHistory();
+void LoadNGramModels();
+void SaveNGramModels();
+void LoadIgnoredWords();
+void SaveIgnoredWords();
+void BuildNGramModelsFromCorpus(const std::wstring& corpusPath);
 void CreateSuggestionWindow(HINSTANCE hInstance);
 void ShowSuggestion();
 LRESULT CALLBACK SuggestionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam);
 void InitTrayIcon(HWND hwnd);
@@ -73,8 +71,8 @@ void ShowCompletionKeyDialog(HWND parentHwnd);
 LRESULT CALLBACK CompletionKeyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 void RemoveWordFromDictionary(const std::wstring& word);
 std::wstring GetWordUnderCaret();
-void LoadIgnoredWords();
-void SaveIgnoredWords();
+std::wstring GetPrediction();
+void UpdateNGramModelsOnSelection(const std::wstring& selectedWord);
 
 // Function to check if character is a Russian letter
 bool IsRussianLetter(wchar_t ch) {
@@ -84,10 +82,12 @@ bool IsRussianLetter(wchar_t ch) {
 // Function to convert Russian character to lowercase
 wchar_t ToLowerRussian(wchar_t ch) {
     if (ch >= L'А' && ch <= L'Я') {
-        return ch + 32; // Difference between uppercase and lowercase in Unicode Cyrillic
-    } else if (ch == L'Ё') {
+        return ch + 32; // Разница между заглавными и строчными буквами в Unicode Cyrillic
+    }
+    else if (ch == L'Ё') {
         return L'ё';
-    } else {
+    }
+    else {
         return ch;
     }
 }
@@ -98,112 +98,165 @@ std::wstring GetKeyName(UINT vkCode) {
     WCHAR keyName[128];
     if (GetKeyNameTextW(scanCode << 16, keyName, 128) > 0) {
         return keyName;
-    } else {
+    }
+    else {
         return L"Unknown";
     }
 }
 
-// Function to load N-gram model from corpus.txt
-void LoadNGramModel() {
-    std::wifstream corpusFile(L"corpus.txt", std::ios::binary);
-    if (!corpusFile.is_open()) {
-        // Create the file with default content
-        std::wofstream newCorpusFile(L"corpus.txt", std::ios::trunc | std::ios::binary);
-        if (!newCorpusFile.is_open()) {
-            MessageBoxW(NULL, L"Не удалось создать файл corpus.txt!", L"Ошибка", MB_ICONERROR);
-            return;
-        }
+// Function to load N-gram models (Unigrams, Bigrams, Trigrams) from corpus.txt
+void LoadNGramModels() {
+    // Построение N-грамм из corpus.txt
+    BuildNGramModelsFromCorpus(L"corpus.txt");
 
-        // Set UTF-16 LE encoding
-        newCorpusFile.imbue(std::locale(newCorpusFile.getloc(),
-            new std::codecvt_utf16<wchar_t, 0x10ffff, std::codecvt_mode::little_endian>));
-
-        // Write default content
-        newCorpusFile << L"привет как дела\n";
-        newCorpusFile << L"я сегодня иду в школу\n";
-        newCorpusFile << L"спасибо за помощь\n";
-        newCorpusFile.close();
-
-        // Open the file again
-        corpusFile.open(L"corpus.txt", std::ios::binary);
-        if (!corpusFile.is_open()) {
-            MessageBoxW(NULL, L"Не удалось открыть файл corpus.txt после создания!", L"Ошибка", MB_ICONERROR);
-            return;
-        }
-    }
-
-    // Set UTF-16 LE encoding
-    corpusFile.imbue(std::locale(corpusFile.getloc(),
-        new std::codecvt_utf16<wchar_t, 0x10ffff, std::codecvt_mode::little_endian>));
-
-    std::wstring prevWord, word;
-    while (corpusFile >> word) {
-        // Convert word to lower case
-        for (auto& ch : word) {
-            ch = ToLowerRussian(ch);
-        }
-
-        if (!prevWord.empty()) {
-            ngramModel[prevWord][word]++;
-        }
-        prevWord = word;
-    }
-
-    corpusFile.close();
+    // Если вы хотите дополнительно загружать существующие модели из файлов, реализуйте это здесь.
+    // Например, для обновления моделей на основе пользовательского ввода.
 }
 
-// Function to save updated N-gram model to user_history.txt
-void SaveNGramModel() {
-    std::wofstream historyFile(L"user_history.txt", std::ios::trunc | std::ios::binary);
-    if (!historyFile.is_open()) {
-        MessageBoxW(NULL, L"Не удалось открыть файл user_history.txt для записи!", L"Ошибка", MB_ICONERROR);
+// Function to build N-gram models from corpus.txt
+void BuildNGramModelsFromCorpus(const std::wstring& corpusPath) {
+    OutputDebugStringW(L"Функция BuildNGramModelsFromCorpus вызвана.\n");
+
+    std::wifstream corpusFile(corpusPath.c_str(), std::ios::binary); // Исправлено здесь
+    if (!corpusFile.is_open()) {
+        MessageBoxW(NULL, L"Не удалось открыть файл corpus.txt!", L"Ошибка", MB_ICONERROR);
+        OutputDebugStringW(L"Не удалось открыть файл corpus.txt.\n");
         return;
     }
 
-    // Set UTF-16 LE encoding
-    historyFile.imbue(std::locale(historyFile.getloc(),
-        new std::codecvt_utf16<wchar_t, 0x10ffff, std::codecvt_mode::little_endian>));
+    // Установите правильную локаль для чтения UTF-8 (или измените на нужную кодировку)
+    corpusFile.imbue(std::locale(corpusFile.getloc(),
+        new std::codecvt_utf8<wchar_t>)); // Изменено на UTF-8
 
-    for (const auto& firstWordPair : ngramModel) {
+    std::wstring line;
+    std::vector<std::wstring> words;
+    int lineCount = 0;
+    int wordCount = 0;
+
+    while (std::getline(corpusFile, line)) {
+        lineCount++;
+        std::wstringstream ss(line);
+        std::wstring word;
+        while (ss >> word) {
+            // Очистка слова от пунктуации и преобразование в нижний регистр
+            std::wstring cleanWord;
+            for (auto& ch : word) {
+                if (IsRussianLetter(ch)) {
+                    cleanWord += ToLowerRussian(ch);
+                }
+            }
+            if (!cleanWord.empty()) {
+                words.push_back(cleanWord);
+                unigramModel[cleanWord]++;
+                wordCount++;
+            }
+        }
+    }
+
+    corpusFile.close();
+
+    // Построение биграмм и триграмм
+    for (size_t i = 0; i < words.size(); ++i) {
+        if (i < words.size() - 1) {
+            bigramModel[words[i]][words[i + 1]]++;
+        }
+        if (i < words.size() - 2) {
+            std::wstring key = words[i] + L" " + words[i + 1];
+            trigramModel[key][words[i + 2]]++;
+        }
+    }
+
+    // Сохранение моделей
+    SaveNGramModels();
+
+    // Отладочные сообщения
+    std::wstring debugMsg = L"Количество обработанных строк: " + std::to_wstring(lineCount) + L"\n";
+    OutputDebugStringW(debugMsg.c_str());
+
+    debugMsg = L"Количество обработанных слов: " + std::to_wstring(wordCount) + L"\n";
+    OutputDebugStringW(debugMsg.c_str());
+
+    OutputDebugStringW(L"N-граммы успешно построены из corpus.txt.\n");
+}
+
+// Function to save N-gram models (Unigrams, Bigrams, Trigrams)
+void SaveNGramModels() {
+    // Save Unigrams to unigrams.txt
+    std::wofstream unigramFile(L"unigrams.txt", std::ios::trunc | std::ios::binary);
+    if (!unigramFile.is_open()) {
+        MessageBoxW(NULL, L"Не удалось открыть файл unigrams.txt для записи!", L"Ошибка", MB_ICONERROR);
+        OutputDebugStringW(L"Не удалось открыть файл unigrams.txt для записи.\n");
+        return;
+    }
+
+    // Set UTF-8 encoding
+    unigramFile.imbue(std::locale(unigramFile.getloc(),
+        new std::codecvt_utf8<wchar_t>)); // Изменено на UTF-8
+
+    for (const auto& pair : unigramModel) {
+        unigramFile << pair.first << L" " << pair.second << L"\n";
+    }
+
+    unigramFile.close();
+
+    // Save Bigrams to bigrams.txt
+    std::wofstream bigramFile(L"bigrams.txt", std::ios::trunc | std::ios::binary);
+    if (!bigramFile.is_open()) {
+        MessageBoxW(NULL, L"Не удалось открыть файл bigrams.txt для записи!", L"Ошибка", MB_ICONERROR);
+        OutputDebugStringW(L"Не удалось открыть файл bigrams.txt для записи.\n");
+        return;
+    }
+
+    // Set UTF-8 encoding
+    bigramFile.imbue(std::locale(bigramFile.getloc(),
+        new std::codecvt_utf8<wchar_t>)); // Изменено на UTF-8
+
+    for (const auto& firstWordPair : bigramModel) {
         const std::wstring& firstWord = firstWordPair.first;
         for (const auto& secondWordPair : firstWordPair.second) {
             const std::wstring& secondWord = secondWordPair.first;
             int count = secondWordPair.second;
-            historyFile << firstWord << L" " << secondWord << L" " << count << L"\n";
+            bigramFile << firstWord << L" " << secondWord << L" " << count << L"\n";
         }
     }
 
-    historyFile.close();
-}
+    bigramFile.close();
 
-// Function to load user history from user_history.txt
-void LoadUserHistory() {
-    std::wifstream historyFile(L"user_history.txt", std::ios::binary);
-    if (!historyFile.is_open()) {
-        // Create the file if it doesn't exist
-        std::wofstream newHistoryFile(L"user_history.txt", std::ios::trunc | std::ios::binary);
-        if (!newHistoryFile.is_open()) {
-            MessageBoxW(NULL, L"Не удалось создать файл user_history.txt!", L"Ошибка", MB_ICONERROR);
-            return;
-        }
-        // Set UTF-16 LE encoding
-        newHistoryFile.imbue(std::locale(newHistoryFile.getloc(),
-            new std::codecvt_utf16<wchar_t, 0x10ffff, std::codecvt_mode::little_endian>));
-        newHistoryFile.close();
+    // Save Trigrams to trigrams.txt
+    std::wofstream trigramFile(L"trigrams.txt", std::ios::trunc | std::ios::binary);
+    if (!trigramFile.is_open()) {
+        MessageBoxW(NULL, L"Не удалось открыть файл trigrams.txt для записи!", L"Ошибка", MB_ICONERROR);
+        OutputDebugStringW(L"Не удалось открыть файл trigrams.txt для записи.\n");
         return;
     }
 
-    // Set UTF-16 LE encoding
-    historyFile.imbue(std::locale(historyFile.getloc(),
-        new std::codecvt_utf16<wchar_t, 0x10ffff, std::codecvt_mode::little_endian>));
+    // Set UTF-8 encoding
+    trigramFile.imbue(std::locale(trigramFile.getloc(),
+        new std::codecvt_utf8<wchar_t>)); // Изменено на UTF-8
 
-    std::wstring firstWord, secondWord;
-    int count;
-    while (historyFile >> firstWord >> secondWord >> count) {
-        ngramModel[firstWord][secondWord] += count;
+    for (const auto& firstWordPair : trigramModel) {
+        const std::wstring& key = firstWordPair.first; // key is "word1 word2"
+        std::wstring word1, word2;
+        size_t spacePos = key.find_first_of(L' ');
+        if (spacePos != std::wstring::npos) {
+            word1 = key.substr(0, spacePos);
+            word2 = key.substr(spacePos + 1);
+        }
+        else {
+            // Если ключ не содержит пробела, пропускаем запись
+            continue;
+        }
+
+        for (const auto& thirdWordPair : firstWordPair.second) {
+            const std::wstring& thirdWord = thirdWordPair.first;
+            int count = thirdWordPair.second;
+            trigramFile << word1 << L" " << word2 << L" " << thirdWord << L" " << count << L"\n";
+        }
     }
 
-    historyFile.close();
+    trigramFile.close();
+
+    OutputDebugStringW(L"N-граммы успешно сохранены в файлы.\n");
 }
 
 // Function to load ignored words from ignored_words.txt
@@ -214,25 +267,30 @@ void LoadIgnoredWords() {
         std::wofstream newIgnoredFile(L"ignored_words.txt", std::ios::trunc | std::ios::binary);
         if (!newIgnoredFile.is_open()) {
             MessageBoxW(NULL, L"Не удалось создать файл ignored_words.txt!", L"Ошибка", MB_ICONERROR);
+            OutputDebugStringW(L"Не удалось создать файл ignored_words.txt.\n");
             return;
         }
-        // Set UTF-16 LE encoding
+        // Set UTF-8 encoding
         newIgnoredFile.imbue(std::locale(newIgnoredFile.getloc(),
-            new std::codecvt_utf16<wchar_t, 0x10ffff, std::codecvt_mode::little_endian>));
+            new std::codecvt_utf8<wchar_t>)); // Изменено на UTF-8
         newIgnoredFile.close();
         return;
     }
 
-    // Set UTF-16 LE encoding
+    // Set UTF-8 encoding
     ignoredFile.imbue(std::locale(ignoredFile.getloc(),
-        new std::codecvt_utf16<wchar_t, 0x10ffff, std::codecvt_mode::little_endian>));
+        new std::codecvt_utf8<wchar_t>)); // Изменено на UTF-8
 
     std::wstring word;
-    while (ignoredFile >> word) {
-        ignoredWords.insert(word);
+    while (std::getline(ignoredFile, word)) {
+        if (!word.empty()) {
+            ignoredWords.insert(word);
+        }
     }
 
     ignoredFile.close();
+
+    OutputDebugStringW(L"Ignored words успешно загружены.\n");
 }
 
 // Function to save ignored words to ignored_words.txt
@@ -240,35 +298,58 @@ void SaveIgnoredWords() {
     std::wofstream ignoredFile(L"ignored_words.txt", std::ios::trunc | std::ios::binary);
     if (!ignoredFile.is_open()) {
         MessageBoxW(NULL, L"Не удалось открыть файл ignored_words.txt для записи!", L"Ошибка", MB_ICONERROR);
+        OutputDebugStringW(L"Не удалось открыть файл ignored_words.txt для записи.\n");
         return;
     }
 
-    // Set UTF-16 LE encoding
+    // Set UTF-8 encoding
     ignoredFile.imbue(std::locale(ignoredFile.getloc(),
-        new std::codecvt_utf16<wchar_t, 0x10ffff, std::codecvt_mode::little_endian>));
+        new std::codecvt_utf8<wchar_t>)); // Изменено на UTF-8
 
     for (const auto& word : ignoredWords) {
         ignoredFile << word << L"\n";
     }
 
     ignoredFile.close();
+
+    OutputDebugStringW(L"Ignored words успешно сохранены.\n");
 }
 
 // Function to remove a word from the dictionary
 void RemoveWordFromDictionary(const std::wstring& word) {
-    // Remove the word from all entries in the n-gram model
-    for (auto& firstWordPair : ngramModel) {
-        firstWordPair.second.erase(word);
+    // Преобразование слова в нижний регистр
+    std::wstring lowerWord = word;
+    for (auto& ch : lowerWord) {
+        ch = ToLowerRussian(ch);
     }
-    // Also remove any entries where this word is a first word
-    ngramModel.erase(word);
 
-    // Add word to ignored words
-    ignoredWords.insert(word);
+    // Удаление слова из unigramModel
+    unigramModel.erase(lowerWord);
 
-    // Save updated N-gram model and ignored words
-    SaveNGramModel();
+    // Удаление слова из всех записей биграмм модели
+    for (auto& firstWordPair : bigramModel) {
+        firstWordPair.second.erase(lowerWord);
+    }
+    // Также удаление записей, где это слово является первым
+    bigramModel.erase(lowerWord);
+
+    // Удаление слова из всех записей триграмм модели
+    for (auto& firstWordPair : trigramModel) {
+        firstWordPair.second.erase(lowerWord);
+    }
+    // Также удаление записей, где это слово является первым
+    trigramModel.erase(lowerWord);
+
+    // Добавление слова в игнорируемые
+    ignoredWords.insert(lowerWord);
+
+    // Сохранение обновленных данных
+    SaveNGramModels();
     SaveIgnoredWords();
+
+    // Отладочное сообщение
+    std::wstring debugMsg = L"Слово удалено и добавлено в игнорируемые: " + lowerWord + L"\n";
+    OutputDebugStringW(debugMsg.c_str());
 }
 
 // Function to get the word under the caret
@@ -286,11 +367,23 @@ std::wstring GetWordUnderCaret() {
     HWND hFocus = guiThreadInfo.hwndFocus;
     if (!hFocus) return L"";
 
-    // Assuming the control is an edit control
+    // Проверка, является ли окно элементом редактирования
+    const int classNameSize = 256;
+    WCHAR className[classNameSize];
+    GetClassNameW(hFocus, className, classNameSize);
+    if (wcscmp(className, L"Edit") != 0) {
+        return L"";
+    }
+
+    LONG_PTR style = GetWindowLongPtrW(hFocus, GWL_STYLE);
+    if (style & ES_READONLY) { // Изменено здесь
+        return L"";
+    }
+
+    // Get the text from the control
     int length = GetWindowTextLengthW(hFocus);
     if (length == 0) return L"";
 
-    // Get the text from the control
     std::wstring text(length + 1, L'\0');
     GetWindowTextW(hFocus, &text[0], length + 1);
     text.resize(length);
@@ -319,7 +412,141 @@ std::wstring GetWordUnderCaret() {
         ch = ToLowerRussian(ch);
     }
 
+    // Отладочное сообщение
+    std::wstring debugMsg = L"Получено слово под кареткой: " + wordUnderCaret + L"\n";
+    OutputDebugStringW(debugMsg.c_str());
+
     return wordUnderCaret;
+}
+
+// Function to get prediction based on N-gram models (Trigrams, Bigrams, and Unigrams) with weighting
+std::wstring GetPrediction() {
+    std::wstring prediction;
+    double maxScore = 0.0;
+
+    // Определение весов для моделей
+    const double unigramWeight = 1.0;
+    const double bigramWeight = 2.0;
+    const double trigramWeight = 3.0;
+
+    // Разделяем предыдущие слова
+    std::wstring key = previousWord;
+    size_t firstSpace = key.find_first_of(L' ');
+    size_t secondSpace = key.find_first_of(L' ', firstSpace + 1);
+    if (firstSpace != std::wstring::npos && secondSpace != std::wstring::npos) {
+        key = key.substr(secondSpace + 1);
+    }
+    else {
+        // Если нет двух предыдущих слов, используем одно
+        if (firstSpace != std::wstring::npos) {
+            key = key.substr(firstSpace + 1);
+        }
+    }
+
+    // Сбор кандидатов из триграмм
+    if (key.find_first_of(L' ') != std::wstring::npos) {
+        auto it = trigramModel.find(key);
+        if (it != trigramModel.end()) {
+            for (const auto& pair : it->second) {
+                const std::wstring& nextWord = pair.first;
+                int count = pair.second;
+
+                if (ignoredWords.find(nextWord) != ignoredWords.end()) {
+                    continue; // Пропускаем игнорируемые слова
+                }
+
+                if (nextWord.length() >= currentInput.length() &&
+                    nextWord.substr(0, currentInput.length()) == currentInput) {
+                    double score = trigramWeight * count;
+                    if (score > maxScore) {
+                        maxScore = score;
+                        prediction = nextWord;
+                    }
+                }
+            }
+        }
+    }
+
+    // Сбор кандидатов из биграмм
+    if (!key.empty() && key.find_first_of(L' ') == std::wstring::npos) {
+        auto it = bigramModel.find(key);
+        if (it != bigramModel.end()) {
+            for (const auto& pair : it->second) {
+                const std::wstring& nextWord = pair.first;
+                int count = pair.second;
+
+                if (ignoredWords.find(nextWord) != ignoredWords.end()) {
+                    continue; // Пропускаем игнорируемые слова
+                }
+
+                if (nextWord.length() >= currentInput.length() &&
+                    nextWord.substr(0, currentInput.length()) == currentInput) {
+                    double score = bigramWeight * count;
+                    if (score > maxScore) {
+                        maxScore = score;
+                        prediction = nextWord;
+                    }
+                }
+            }
+        }
+    }
+
+    // Сбор кандидатов из униграмм
+    if (!currentInput.empty()) {
+        for (const auto& pair : unigramModel) {
+            const std::wstring& word = pair.first;
+            int count = pair.second;
+
+            if (ignoredWords.find(word) != ignoredWords.end()) {
+                continue; // Пропускаем игнорируемые слова
+            }
+
+            if (word.length() >= currentInput.length() &&
+                word.substr(0, currentInput.length()) == currentInput) {
+                double score = unigramWeight * count;
+                if (score > maxScore) {
+                    maxScore = score;
+                    prediction = word;
+                }
+            }
+        }
+    }
+
+    // Отладочное сообщение
+    std::wstring debugMsg = L"Предсказание: " + prediction + L"\n";
+    OutputDebugStringW(debugMsg.c_str());
+
+    return prediction;
+}
+
+// Function to update N-gram models upon selecting a prediction
+void UpdateNGramModelsOnSelection(const std::wstring& selectedWord) {
+    if (!previousWord.empty()) {
+        size_t firstSpace = previousWord.find_first_of(L' ');
+        size_t secondSpace = previousWord.find_first_of(L' ', firstSpace + 1);
+        std::wstring newKey;
+        if (firstSpace != std::wstring::npos && secondSpace != std::wstring::npos) {
+            newKey = previousWord.substr(secondSpace + 1) + L" " + selectedWord;
+            trigramModel[previousWord][selectedWord]++;
+        }
+        else if (firstSpace != std::wstring::npos) {
+            newKey = previousWord.substr(firstSpace + 1) + L" " + selectedWord;
+            trigramModel[previousWord][selectedWord]++;
+        }
+        else {
+            newKey = selectedWord;
+            bigramModel[previousWord][selectedWord]++;
+        }
+        previousWord = newKey;
+    }
+    else {
+        // Если previousWord пусто, устанавливаем текущий ввод как предыдущий
+        previousWord = selectedWord;
+    }
+
+    // Отладочное сообщение
+    std::wstring debugMsg = L"N-грамма обновлена с выбранным словом: " + selectedWord + L"\n";
+    OutputDebugStringW(debugMsg.c_str());
 }
 
 // Window procedure for suggestion window
@@ -366,20 +593,19 @@ LRESULT CALLBACK SuggestionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     case WM_DESTROY:
         PostQuitMessage(0);
         break;
-    case WM_TRAYICON:
-        if (lParam == WM_RBUTTONUP) {
-            ShowContextMenu(hwnd);
-        }
-        break;
     case WM_RBUTTONDOWN: {
-        // Show context menu to delete or ignore word
+        // Показ контекстного меню для удаления или игнорирования слова
         POINT pt;
         GetCursorPos(&pt);
         HMENU hContextMenu = CreatePopupMenu();
         AppendMenuW(hContextMenu, MF_STRING, 2001, L"Удалить");
         AppendMenuW(hContextMenu, MF_STRING, 2002, L"Игнорировать");
 
-        SetForegroundWindow(hwnd); // Necessary to ensure the menu closes correctly
+        SetForegroundWindow(hwnd); // Необходимо для корректного закрытия меню
+
+        // Установка флага перед открытием меню
+        isContextMenuOpen = true;
+
         UINT clicked = TrackPopupMenu(
             hContextMenu,
             TPM_RETURNCMD | TPM_RIGHTBUTTON,
@@ -389,27 +615,66 @@ LRESULT CALLBACK SuggestionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
             hwnd,
             NULL
         );
+
+        // Сброс флага после закрытия меню
+        isContextMenuOpen = false;
+
         DestroyMenu(hContextMenu);
 
-        // Retrieve the suggested word directly from the window text
+        // Получение предложенного слова из текста окна подсказки
         wchar_t buffer[256];
         GetWindowTextW(hwnd, buffer, 256);
         std::wstring word(buffer);
 
-        if (clicked == 2001) {
-            // Remove the word from the dictionary
-            RemoveWordFromDictionary(word);
-            suggestedWord.clear();
-            ShowSuggestion();
-        } else if (clicked == 2002) {
-            // Add word to ignored words
-            ignoredWords.insert(word);
-            SaveIgnoredWords();
-            suggestedWord.clear();
-            ShowSuggestion();
+        if (!word.empty()) { // Убедимся, что слово не пустое
+            if (clicked == 2001) {
+                // Удаление слова из словаря
+                RemoveWordFromDictionary(word);
+                // Очистка предложения и скрытие окна
+                suggestedWord.clear();
+                ShowSuggestion();
+
+                // Отладочное сообщение
+                std::wstring debugMsg = L"Слово удалено: " + word + L"\n";
+                OutputDebugStringW(debugMsg.c_str());
+            }
+            else if (clicked == 2002) {
+                // Добавление слова в игнорируемые
+                std::wstring lowerWord = word;
+                for (auto& ch : lowerWord) {
+                    ch = ToLowerRussian(ch);
+                }
+                ignoredWords.insert(lowerWord);
+                SaveIgnoredWords();
+                // Очистка предложения и скрытие окна
+                suggestedWord.clear();
+                ShowSuggestion();
+
+                // Отладочное сообщение
+                std::wstring debugMsg = L"Слово добавлено в игнорируемые: " + lowerWord + L"\n";
+                OutputDebugStringW(debugMsg.c_str());
+            }
         }
+
         break;
     }
+    default:
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+// Оконная процедура для основного окна
+LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_TRAYICON:
+        if (lParam == WM_RBUTTONUP) {
+            ShowContextMenu(hwnd);
+        }
+        break;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
     default:
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
@@ -442,12 +707,15 @@ void CreateSuggestionWindow(HINSTANCE hInstance) {
     // Add drop shadow effect
     MARGINS margins = {0, 0, 0, 0};
     DwmExtendFrameIntoClientArea(suggestionWindow, &margins);
+
+    OutputDebugStringW(L"Suggestion window создано.\n"); // Отладочное сообщение
 }
 
 // Function to show suggestion near the caret as a tooltip
 void ShowSuggestion() {
     if (suggestedWord.empty()) {
         ShowWindow(suggestionWindow, SW_HIDE);
+        OutputDebugStringW(L"Предложение скрыто.\n"); // Отладочное сообщение
         return;
     }
 
@@ -487,7 +755,12 @@ void ShowSuggestion() {
 
         // Redraw the window
         InvalidateRect(suggestionWindow, NULL, TRUE);
-    } else {
+
+        // Отладочное сообщение
+        std::wstring debugMsg = L"Предложение показано: " + suggestedWord + L"\n";
+        OutputDebugStringW(debugMsg.c_str());
+    }
+    else {
         // Fallback to cursor position if caret position is not available
         POINT cursorPos;
         GetCursorPos(&cursorPos);
@@ -514,17 +787,38 @@ void ShowSuggestion() {
 
         // Redraw the window
         InvalidateRect(suggestionWindow, NULL, TRUE);
+
+        // Отладочное сообщение
+        std::wstring debugMsg = L"Предложение показано на позиции курсора: " + suggestedWord + L"\n";
+        OutputDebugStringW(debugMsg.c_str());
     }
 }
 
-// Initialize system tray icon
+// Initialize system tray icon with custom icon
 void InitTrayIcon(HWND hwnd) {
     nid.cbSize = sizeof(NOTIFYICONDATA);
     nid.hWnd = hwnd;
     nid.uID = 1; // Identifier of the icon
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+
+    // Загрузка пользовательской иконки из файла
+    HICON hIcon = (HICON)LoadImageW(
+        NULL,
+        L"icon.ico", // Убедитесь, что файл icon.ico существует в рабочей директории
+        IMAGE_ICON,
+        32, 32, // Размер иконки
+        LR_LOADFROMFILE
+    );
+
+    if (hIcon) {
+        nid.hIcon = hIcon;
+    }
+    else {
+        // Если не удалось загрузить пользовательскую иконку, используем стандартную
+        nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    }
+
     wcscpy_s(nid.szTip, ARRAYSIZE(nid.szTip), L"T9 Application");
 
     Shell_NotifyIcon(NIM_ADD, &nid);
@@ -540,6 +834,9 @@ void InitTrayIcon(HWND hwnd) {
 
     AppendMenuW(hMenu, MF_STRING, 1003, L"Клавиша дополнения");
     AppendMenuW(hMenu, MF_STRING, 1002, L"Выход");
+
+    // Отладочное сообщение
+    OutputDebugStringW(L"System tray icon и меню инициализированы.\n");
 }
 
 // Show context menu on right-click
@@ -552,7 +849,8 @@ void ShowContextMenu(HWND hwnd) {
     if (isAutocompleteEnabled) {
         EnableMenuItem(hSubMenu, 1004, MF_BYCOMMAND | MF_GRAYED);
         EnableMenuItem(hSubMenu, 1005, MF_BYCOMMAND | MF_ENABLED);
-    } else {
+    }
+    else {
         EnableMenuItem(hSubMenu, 1004, MF_BYCOMMAND | MF_ENABLED);
         EnableMenuItem(hSubMenu, 1005, MF_BYCOMMAND | MF_GRAYED);
     }
@@ -571,20 +869,35 @@ void ShowContextMenu(HWND hwnd) {
         // Activate the application
         isAutocompleteEnabled = true;
         MessageBoxW(NULL, L"Автодополнение активировано.", L"T9 Application", MB_OK);
-    } else if (clicked == 1005) {
+
+        // Отладочное сообщение
+        OutputDebugStringW(L"Автодополнение активировано.\n");
+    }
+    else if (clicked == 1005) {
         // Deactivate the application
         isAutocompleteEnabled = false;
         MessageBoxW(NULL, L"Автодополнение деактивировано.", L"T9 Application", MB_OK);
         // Hide suggestion window
         suggestedWord.clear();
         ShowSuggestion();
-    } else if (clicked == 1002) {
+
+        // Отладочное сообщение
+        OutputDebugStringW(L"Автодополнение деактивировано.\n");
+    }
+    else if (clicked == 1002) {
         // Exit the application
         Cleanup();
         PostQuitMessage(0);
-    } else if (clicked == 1003) {
+
+        // Отладочное сообщение
+        OutputDebugStringW(L"Приложение завершает работу.\n");
+    }
+    else if (clicked == 1003) {
         // Open completion key dialog
         ShowCompletionKeyDialog(hwnd);
+
+        // Отладочное сообщение
+        OutputDebugStringW(L"Открыт диалог настройки клавиши дополнения.\n");
     }
 }
 
@@ -615,6 +928,9 @@ void ShowCompletionKeyDialog(HWND parentHwnd) {
     ShowWindow(hDlg, SW_SHOW);
     UpdateWindow(hDlg);
 
+    // Отладочное сообщение
+    OutputDebugStringW(L"Диалог настройки клавиши дополнения открыт.\n");
+
     // Message loop for the dialog
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
@@ -628,6 +944,9 @@ void ShowCompletionKeyDialog(HWND parentHwnd) {
     }
 
     isSettingCompletionKey = false; // Reset the flag when done
+
+    // Отладочное сообщение
+    OutputDebugStringW(L"Диалог настройки клавиши дополнения закрыт.\n");
 }
 
 // Window procedure for completion key dialog
@@ -639,9 +958,10 @@ LRESULT CALLBACK CompletionKeyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     switch (msg) {
     case WM_CREATE: {
         // Create static text
+        std::wstring initialText = L"Текущая клавиша: " + GetKeyName(completionKey);
         hStatic = CreateWindowW(
             L"STATIC",
-            (L"Текущая клавиша: " + GetKeyName(completionKey)).c_str(),
+            initialText.c_str(),
             WS_VISIBLE | WS_CHILD,
             20, 20, 260, 20,
             hwnd, NULL, NULL, NULL
@@ -671,20 +991,35 @@ LRESULT CALLBACK CompletionKeyWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
             waitingForKey = true;
             SetWindowTextW(hStatic, L"Нажмите новую клавишу...");
             SetFocus(hwnd); // Set focus to capture keyboard input
-        } else if (LOWORD(wParam) == 2) { // "OK" button
+
+            // Отладочное сообщение
+            OutputDebugStringW(L"Ожидание новой клавиши дополнения...\n");
+        }
+        else if (LOWORD(wParam) == 2) { // "OK" button
             DestroyWindow(hwnd);
+
+            // Отладочное сообщение
+            OutputDebugStringW(L"Нажата кнопка OK в диалоге настройки клавиши.\n");
         }
         break;
     case WM_KEYDOWN:
         if (waitingForKey) {
             completionKey = (UINT)wParam;
             std::wstring keyName = GetKeyName(completionKey);
-            SetWindowTextW(hStatic, (L"Текущая клавиша: " + keyName).c_str());
+            std::wstring newText = L"Текущая клавиша: " + keyName;
+            SetWindowTextW(hStatic, newText.c_str());
             waitingForKey = false;
+
+            // Отладочное сообщение
+            std::wstring debugMsg = L"Клавиша дополнения изменена на: " + keyName + L"\n";
+            OutputDebugStringW(debugMsg.c_str());
         }
         break;
     case WM_DESTROY:
         UnregisterClassW(L"CompletionKeyWindowClass", GetModuleHandle(NULL));
+
+        // Отладочное сообщение
+        OutputDebugStringW(L"Диалог настройки клавиши дополнения уничтожен.\n");
         break;
     default:
         return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -711,63 +1046,17 @@ void Cleanup() {
         DestroyWindow(suggestionWindow);
         suggestionWindow = NULL;
     }
-    // Save updated N-gram model and ignored words
-    SaveNGramModel();
+    // Освобождение иконки, если она загружена
+    if (nid.hIcon) {
+        DestroyIcon(nid.hIcon);
+    }
+    // Save updated unigramModel, bigramModel, and trigramModel
+    SaveNGramModels();
+    // Save ignored words
     SaveIgnoredWords();
-}
 
-// Function to get prediction based on N-gram model
-std::wstring GetPrediction() {
-    std::wstring prediction;
-
-    // Use previous word and current input to find a suggestion
-    if (!previousWord.empty()) {
-        auto it = ngramModel.find(previousWord);
-        if (it != ngramModel.end()) {
-            int maxCount = 0;
-            for (const auto& pair : it->second) {
-                const std::wstring& nextWord = pair.first;
-                int count = pair.second;
-
-                if (ignoredWords.find(nextWord) != ignoredWords.end()) {
-                    continue; // Skip ignored words
-                }
-
-                if (nextWord.length() >= currentInput.length() &&
-                    nextWord.substr(0, currentInput.length()) == currentInput) {
-                    if (count > maxCount) {
-                        maxCount = count;
-                        prediction = nextWord; // Return the full word
-                    }
-                }
-            }
-        }
-    }
-
-    // If no prediction based on previous word, check current input globally
-    if (prediction.empty()) {
-        int maxCount = 0;
-        for (const auto& firstWordPair : ngramModel) {
-            for (const auto& secondWordPair : firstWordPair.second) {
-                const std::wstring& nextWord = secondWordPair.first;
-                int count = secondWordPair.second;
-
-                if (ignoredWords.find(nextWord) != ignoredWords.end()) {
-                    continue; // Skip ignored words
-                }
-
-                if (nextWord.length() >= currentInput.length() &&
-                    nextWord.substr(0, currentInput.length()) == currentInput) {
-                    if (count > maxCount) {
-                        maxCount = count;
-                        prediction = nextWord; // Return the full word
-                    }
-                }
-            }
-        }
-    }
-
-    return prediction;
+    // Отладочное сообщение
+    OutputDebugStringW(L"Ресурсы очищены и сохранены.\n");
 }
 
 // Keyboard hook callback
@@ -802,9 +1091,6 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
                 // Simulate typing the suggested word
                 std::wstring textToInsert = suggestedWord;
-                if (completionKey == VK_SPACE) {
-                    textToInsert += L" ";
-                }
 
                 for (wchar_t ch : textToInsert) {
                     SHORT vk = VkKeyScanW(ch);
@@ -826,27 +1112,49 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     }
                 }
 
-                // Update N-gram model with user input
-                if (!previousWord.empty()) {
-                    ngramModel[previousWord][suggestedWord]++;
-                }
-                previousWord = suggestedWord;
+                // Update N-gram models with user input
+                UpdateNGramModelsOnSelection(suggestedWord);
 
                 currentInput.clear();
                 suggestedWord.clear();
                 ShowSuggestion();
 
+                // Отладочное сообщение
+                OutputDebugStringW(L"Предложение принято и вставлено.\n");
+
                 return 1; // Suppress original key
-            } else {
+            }
+            else {
                 // If no current input or suggestion, process normally
                 if (!currentInput.empty()) {
-                    // Update N-gram model with user input
+                    // Update N-gram models with user input
                     if (!previousWord.empty()) {
-                        ngramModel[previousWord][currentInput]++;
+                        // Добавляем триграмму или биграмму в зависимости от количества слов
+                        size_t firstSpace = previousWord.find_first_of(L' ');
+                        size_t secondSpace = previousWord.find_first_of(L' ', firstSpace + 1);
+                        std::wstring newKey;
+                        if (firstSpace != std::wstring::npos && secondSpace != std::wstring::npos) {
+                            newKey = previousWord.substr(secondSpace + 1) + L" " + currentInput;
+                            trigramModel[previousWord][currentInput]++;
+                        }
+                        else if (firstSpace != std::wstring::npos) {
+                            newKey = previousWord.substr(firstSpace + 1) + L" " + currentInput;
+                            trigramModel[previousWord][currentInput]++;
+                        }
+                        else {
+                            newKey = currentInput;
+                            bigramModel[previousWord][currentInput]++;
+                        }
+                        previousWord = newKey;
                     }
-                    previousWord = currentInput;
+                    else {
+                        // Если previousWord пусто, устанавливаем текущий ввод как предыдущий
+                        previousWord = currentInput;
+                    }
                     currentInput.clear();
-                } else {
+                }
+                else {
+                    // Если currentInput пусто, сбрасываем previousWord
                     previousWord.clear();
                 }
                 suggestedWord.clear();
@@ -861,8 +1169,13 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 // Hide the suggestion and suppress the Backspace key
                 suggestedWord.clear();
                 ShowSuggestion();
+
+                // Отладочное сообщение
+                OutputDebugStringW(L"Backspace нажата, предложение скрыто.\n");
+
                 return 1; // Suppress the backspace key
-            } else {
+            }
+            else {
                 // Allow Backspace to proceed
                 return CallNextHookEx(keyboardHook, nCode, wParam, lParam);
             }
@@ -877,10 +1190,17 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 if (!currentInput.empty()) {
                     suggestedWord = GetPrediction();
                     ShowSuggestion();
-                } else {
+
+                    // Отладочное сообщение
+                    OutputDebugStringW(L"Caret перемещен, предложение обновлено.\n");
+                }
+                else {
                     currentInput.clear();
                     suggestedWord.clear();
                     ShowSuggestion();
+
+                    // Отладочное сообщение
+                    OutputDebugStringW(L"Caret перемещен, предложение скрыто.\n");
                 }
             }
             return CallNextHookEx(keyboardHook, nCode, wParam, lParam);
@@ -909,38 +1229,112 @@ LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 if (isAutocompleteEnabled) {
                     suggestedWord = GetPrediction();
                     ShowSuggestion();
+
+                    // Отладочное сообщение
+                    std::wstring debugMsg = L"Добавлена буква: " + std::wstring(1, ch) + L", предложение: " + suggestedWord + L"\n";
+                    OutputDebugStringW(debugMsg.c_str());
                 }
-            } else {
+            }
+            else if (ch == L' ') {
+                // Обработка ввода пробела
+                if (!currentInput.empty()) {
+                    // Обновляем предыдущие слова, добавляя текущий ввод
+                    if (!previousWord.empty()) {
+                        size_t firstSpace = previousWord.find_first_of(L' ');
+                        size_t secondSpace = previousWord.find_first_of(L' ', firstSpace + 1);
+                        std::wstring newKey;
+                        if (firstSpace != std::wstring::npos && secondSpace != std::wstring::npos) {
+                            newKey = previousWord.substr(secondSpace + 1) + L" " + currentInput;
+                            trigramModel[previousWord][currentInput]++;
+                        }
+                        else if (firstSpace != std::wstring::npos) {
+                            newKey = previousWord.substr(firstSpace + 1) + L" " + currentInput;
+                            trigramModel[previousWord][currentInput]++;
+                        }
+                        else {
+                            newKey = currentInput;
+                            bigramModel[previousWord][currentInput]++;
+                        }
+
+                        previousWord = newKey;
+                    }
+                    else {
+                        previousWord = currentInput;
+                    }
+
+                    currentInput.clear();
+                    suggestedWord = GetPrediction();
+                    ShowSuggestion();
+
+                    // Отладочное сообщение
+                    std::wstring debugMsg = L"Введен пробел, предложение: " + suggestedWord + L"\n";
+                    OutputDebugStringW(debugMsg.c_str());
+                }
+            }
+            else {
                 // If non-letter character, reset input
                 if (!currentInput.empty()) {
-                    // Update N-gram model with user input
+                    // Update N-gram models with user input
                     if (!previousWord.empty()) {
-                        ngramModel[previousWord][currentInput]++;
+                        size_t firstSpace = previousWord.find_first_of(L' ');
+                        size_t secondSpace = previousWord.find_first_of(L' ', firstSpace + 1);
+                        std::wstring newKey;
+                        if (firstSpace != std::wstring::npos && secondSpace != std::wstring::npos) {
+                            newKey = previousWord.substr(secondSpace + 1) + L" " + currentInput;
+                            trigramModel[previousWord][currentInput]++;
+                        }
+                        else if (firstSpace != std::wstring::npos) {
+                            newKey = previousWord.substr(firstSpace + 1) + L" " + currentInput;
+                            trigramModel[previousWord][currentInput]++;
+                        }
+                        else {
+                            newKey = currentInput;
+                            bigramModel[previousWord][currentInput]++;
+                        }
+                        previousWord = newKey;
                     }
-                    previousWord = currentInput;
-                } else {
+                    else {
+                        previousWord = currentInput;
+                    }
+                    currentInput.clear();
+                }
+                else {
                     previousWord.clear();
                 }
-                currentInput.clear();
                 suggestedWord.clear();
                 ShowSuggestion();
+
+                // Отладочное сообщение
+                OutputDebugStringW(L"Введен не буква или пробел, предложение скрыто.\n");
             }
-        } else {
+        }
+        else {
             // Other keys
             if (isAutocompleteEnabled) {
                 currentInput = GetWordUnderCaret();
                 if (!currentInput.empty()) {
                     suggestedWord = GetPrediction();
                     ShowSuggestion();
-                } else {
+
+                    // Отладочное сообщение
+                    OutputDebugStringW(L"Введен символ без преобразования, предложение обновлено.\n");
+                }
+                else {
                     currentInput.clear();
                     suggestedWord.clear();
                     ShowSuggestion();
+
+                    // Отладочное сообщение
+                    OutputDebugStringW(L"Введен символ без преобразования, предложение скрыто.\n");
                 }
-            } else {
+            }
+            else {
                 currentInput.clear();
                 suggestedWord.clear();
                 ShowSuggestion();
+
+                // Отладочное сообщение
+                OutputDebugStringW(L"Автодополнение отключено, предложение скрыто.\n");
             }
         }
     }
@@ -956,9 +1350,15 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN) {
                 HWND hWndUnderCursor = WindowFromPoint(pMouseStruct->pt);
                 if (hWndUnderCursor != suggestionWindow && hWndUnderCursor != GetParent(suggestionWindow)) {
-                    // Hide suggestion on mouse click outside the suggestion window
-                    suggestedWord.clear();
-                    ShowSuggestion();
+                    // Проверка флага: если контекстное меню открыто, не скрывать окно
+                    if (!isContextMenuOpen) {
+                        // Hide suggestion on mouse click outside the suggestion window
+                        suggestedWord.clear();
+                        ShowSuggestion();
+
+                        // Отладочное сообщение
+                        OutputDebugStringW(L"Мышь кликнута вне окна подсказки, предложение скрыто.\n");
+                    }
                 }
             }
             if (wParam == WM_LBUTTONDOWN) {
@@ -968,10 +1368,17 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     if (!currentInput.empty()) {
                         suggestedWord = GetPrediction();
                         ShowSuggestion();
-                    } else {
+
+                        // Отладочное сообщение
+                        OutputDebugStringW(L"Левый клик, предложение обновлено.\n");
+                    }
+                    else {
                         currentInput.clear();
                         suggestedWord.clear();
                         ShowSuggestion();
+
+                        // Отладочное сообщение
+                        OutputDebugStringW(L"Левый клик, предложение скрыто.\n");
                     }
                 }
             }
@@ -982,11 +1389,8 @@ LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
 // Main function
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
-    // Load N-gram model from corpus.txt
-    LoadNGramModel();
-
-    // Load user history
-    LoadUserHistory();
+    // Load N-gram models (Unigrams, Bigrams, Trigrams)
+    LoadNGramModels();
 
     // Load ignored words
     LoadIgnoredWords();
@@ -994,16 +1398,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     // Create suggestion window
     CreateSuggestionWindow(hInstance);
 
-    // Create a hidden window to receive messages
-    WNDCLASSW wc = {0};
-    wc.lpfnWndProc = SuggestionWndProc;
-    wc.hInstance = hInstance;
-    wc.lpszClassName = L"MainWindowClass";
+    // Register class for main window
+    WNDCLASSW mainWc = {0};
+    mainWc.lpfnWndProc = MainWndProc; // Используем отдельную оконную процедуру
+    mainWc.hInstance = hInstance;
+    mainWc.lpszClassName = L"MainWindowClass";
 
-    RegisterClassW(&wc);
+    RegisterClassW(&mainWc);
 
+    // Create main window
     HWND hwndMain = CreateWindowW(
-        wc.lpszClassName,
+        mainWc.lpszClassName,
         L"T9 Application",
         WS_OVERLAPPEDWINDOW,
         0, 0, 0, 0,
@@ -1017,6 +1422,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, hInstance, 0);
     if (!keyboardHook) {
         MessageBoxW(NULL, L"Не удалось установить хук клавиатуры!", L"Ошибка", MB_ICONERROR);
+        OutputDebugStringW(L"Не удалось установить хук клавиатуры.\n");
         return 1;
     }
 
@@ -1024,6 +1430,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, hInstance, 0);
     if (!mouseHook) {
         MessageBoxW(NULL, L"Не удалось установить хук мыши!", L"Ошибка", MB_ICONERROR);
+        OutputDebugStringW(L"Не удалось установить хук мыши.\n");
         UnhookWindowsHookEx(keyboardHook);
         return 1;
     }
@@ -1031,12 +1438,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     // Message loop
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
-        if (msg.message == WM_TRAYICON) {
-            SuggestionWndProc(hwndMain, msg.message, msg.wParam, msg.lParam);
-        } else {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
     }
 
     // Cleanup
